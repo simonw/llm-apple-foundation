@@ -1,11 +1,14 @@
 import asyncio
+import base64
 import copy
+import json
 import queue
 import threading
+import zlib
 from typing import AsyncGenerator, Callable, Iterator, Literal, Optional
 
 import llm
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class AppleFoundationOptions(llm.Options):
@@ -46,6 +49,22 @@ class AppleFoundationOptions(llm.Options):
         description="Apple system model guardrail configuration",
         default="default",
     )
+
+    @model_validator(mode="after")
+    def validate_sampling_options(self):
+        if self.top is not None and self.probability_threshold is not None:
+            raise ValueError(
+                "top and probability_threshold cannot be used together"
+            )
+        if (
+            self.top is not None
+            or self.probability_threshold is not None
+            or self.seed is not None
+        ) and self.sampling != "random":
+            raise ValueError(
+                "top, probability_threshold, and seed require sampling=random"
+            )
+        return self
 
 
 def _load_sdk():
@@ -132,14 +151,45 @@ def _normalize_schema(schema):
     return normalized
 
 
+_TRANSCRIPT_ENCODING = "base64+zlib+json"
+
+
+def _pack_transcript(transcript):
+    raw = json.dumps(
+        transcript,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "type": "FoundationModels.Transcript",
+        "encoding": _TRANSCRIPT_ENCODING,
+        "data": base64.b64encode(zlib.compress(raw)).decode("ascii"),
+    }
+
+
+def _unpack_transcript(value):
+    if (
+        not isinstance(value, dict)
+        or value.get("type") != "FoundationModels.Transcript"
+    ):
+        return None
+    if value.get("encoding") == _TRANSCRIPT_ENCODING:
+        try:
+            compressed = base64.b64decode(value["data"])
+            return json.loads(zlib.decompress(compressed).decode("utf-8"))
+        except (KeyError, TypeError, ValueError, zlib.error) as ex:
+            raise llm.ModelError("Stored Apple Foundation transcript is invalid") from ex
+    # Support transcripts logged by earlier development versions.
+    if "transcript" in value:
+        return value
+    return None
+
+
 async def _create_session(fm, system_model, prompt, conversation):
     if conversation:
         for previous_response in reversed(conversation.responses):
-            transcript_data = previous_response.response_json
-            if (
-                isinstance(transcript_data, dict)
-                and transcript_data.get("type") == "FoundationModels.Transcript"
-            ):
+            transcript_data = _unpack_transcript(previous_response.response_json)
+            if transcript_data:
                 transcript = await fm.Transcript.from_dict(transcript_data)
                 return fm.LanguageModelSession.from_transcript(
                     transcript,
@@ -192,7 +242,9 @@ async def _execute_async(
                 options=generation_options,
             )
             yield result
-        response.response_json = await session.transcript.to_dict()
+        response.response_json = _pack_transcript(
+            await session.transcript.to_dict()
+        )
     except fm.FoundationModelsError as ex:
         raise llm.ModelError(str(ex)) from ex
 

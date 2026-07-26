@@ -5,7 +5,17 @@ description = "Run prompts through Apple Foundation models on macOS"
 readme = "README.md"
 authors = [{name = "Simon Willison"}]
 license = "Apache-2.0"
-classifiers = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.10"
 dependencies = [
     "apple-fm-sdk>=0.2.1",

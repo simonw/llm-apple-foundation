@@ -3,6 +3,9 @@ import json
 
 import llm
 import pytest
+from click.testing import CliRunner
+from llm.cli import cli
+from pydantic import ValidationError
 
 
 @pytest.fixture(scope="session")
@@ -38,6 +41,23 @@ def test_options_are_registered():
         "use_case",
         "guardrails",
     }
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        {"top": 10},
+        {
+            "sampling": "random",
+            "top": 10,
+            "probability_threshold": 0.9,
+        },
+    ),
+)
+def test_invalid_sampling_option_combinations(options):
+    model = llm.get_model("apple-foundation")
+    with pytest.raises(ValidationError):
+        model.prompt("Hello", **options)
 
 
 def test_prompt_uses_actual_model(model):
@@ -115,6 +135,39 @@ def test_conversation_uses_actual_model_and_restores_transcript(model):
     answer = second.text().lower()
     assert "violet" in answer
     assert "pelican" in answer
+
+
+def test_conversation_survives_database_round_trip(
+    apple_model_is_available, tmp_path
+):
+    database = str(tmp_path / "logs.db")
+    runner = CliRunner()
+    first = runner.invoke(
+        cli,
+        (
+            "-m",
+            "apple-foundation",
+            "--no-stream",
+            "--database",
+            database,
+            "Remember the phrase 'amber puffin'. Reply only with OK.",
+        ),
+    )
+    assert first.exit_code == 0, first.output
+
+    second = runner.invoke(
+        cli,
+        (
+            "-c",
+            "--no-stream",
+            "--database",
+            database,
+            "What phrase did I ask you to remember?",
+        ),
+    )
+    assert second.exit_code == 0, second.output
+    assert "amber" in second.output.lower()
+    assert "puffin" in second.output.lower()
 
 
 def test_async_prompt_uses_actual_model(apple_model_is_available):
