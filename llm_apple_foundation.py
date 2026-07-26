@@ -1,11 +1,19 @@
 import asyncio
 import base64
 import copy
+import inspect
 import json
 import queue
+import re
 import threading
 import zlib
-from typing import AsyncGenerator, Callable, Iterator, Literal, Optional
+from typing import (
+    AsyncGenerator,
+    Callable,
+    Iterator,
+    Literal,
+    Optional,
+)
 
 import llm
 from pydantic import Field, model_validator
@@ -53,9 +61,7 @@ class AppleFoundationOptions(llm.Options):
     @model_validator(mode="after")
     def validate_sampling_options(self):
         if self.top is not None and self.probability_threshold is not None:
-            raise ValueError(
-                "top and probability_threshold cannot be used together"
-            )
+            raise ValueError("top and probability_threshold cannot be used together")
         if (
             self.top is not None
             or self.probability_threshold is not None
@@ -151,6 +157,230 @@ def _normalize_schema(schema):
     return normalized
 
 
+def _tool_schema(fm, tool):
+    from apple_fm_sdk.generation_property import Property
+
+    root_schema = tool.input_schema or {"type": "object", "properties": {}}
+    definitions = {
+        **root_schema.get("$defs", {}),
+        **root_schema.get("definitions", {}),
+    }
+
+    def schema_error(message):
+        raise llm.ModelError(
+            f"Tool '{tool.name}' has an unsupported input schema: {message}"
+        )
+
+    def resolve(schema):
+        reference = schema.get("$ref")
+        if not reference:
+            return schema
+        prefix, _, name = reference.rpartition("/")
+        if prefix not in ("#/$defs", "#/definitions") or name not in definitions:
+            schema_error(f"unresolved reference {reference!r}")
+        return definitions[name]
+
+    def guides_for(schema):
+        guides = []
+        enum = schema.get("enum")
+        if enum is not None:
+            if not enum or not all(isinstance(value, str) for value in enum):
+                schema_error("enum values must be strings")
+            guides.append(fm.GenerationGuide.anyOf(enum))
+        if "const" in schema:
+            if not isinstance(schema["const"], str):
+                schema_error("const values must be strings")
+            guides.append(fm.GenerationGuide.constant(schema["const"]))
+        if "minimum" in schema:
+            guides.append(fm.GenerationGuide.minimum(schema["minimum"]))
+        if "maximum" in schema:
+            guides.append(fm.GenerationGuide.maximum(schema["maximum"]))
+        if "minItems" in schema:
+            guides.append(fm.GenerationGuide.min_items(schema["minItems"]))
+        if "maxItems" in schema:
+            guides.append(fm.GenerationGuide.max_items(schema["maxItems"]))
+        if "pattern" in schema:
+            guides.append(fm.GenerationGuide.regex(schema["pattern"]))
+        return guides
+
+    def field_type(schema, title):
+        schema = resolve(schema)
+        variants = schema.get("anyOf") or schema.get("oneOf")
+        if variants:
+            non_null = [
+                variant
+                for variant in variants
+                if resolve(variant).get("type") != "null"
+            ]
+            if len(non_null) != 1 or len(non_null) == len(variants):
+                schema_error("only nullable anyOf/oneOf unions are supported")
+            value_type, nested = field_type(non_null[0], title)
+            return Optional[value_type], nested
+
+        schema_type = schema.get("type")
+        if isinstance(schema_type, list):
+            non_null_types = [item for item in schema_type if item != "null"]
+            if len(non_null_types) != 1 or len(non_null_types) == len(schema_type):
+                schema_error("only nullable type unions are supported")
+            nullable_schema = dict(schema)
+            nullable_schema["type"] = non_null_types[0]
+            value_type, nested = field_type(nullable_schema, title)
+            return Optional[value_type], nested
+
+        primitive_types = {
+            "string": str,
+            "integer": int,
+            "number": float,
+            "boolean": bool,
+        }
+        if schema_type in primitive_types:
+            return primitive_types[schema_type], []
+        if schema_type == "array":
+            items = schema.get("items")
+            if not isinstance(items, dict):
+                schema_error("arrays must declare a single items schema")
+            item_type, nested = field_type(items, f"{title}Item")
+            return list[item_type], nested
+        if schema_type == "object" or "properties" in schema:
+            nested_schema = build_schema(schema, title)
+            return nested_schema.type_class, [
+                nested_schema,
+                *nested_schema.dynamic_nested_types,
+            ]
+        schema_error(f"unknown type {schema_type!r}")
+
+    def build_schema(schema, title):
+        schema = resolve(schema)
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            schema_error("properties must be an object")
+        if schema.get("additionalProperties") not in (None, False):
+            schema_error("additionalProperties is not supported")
+
+        required = set(schema.get("required") or [])
+        apple_properties = []
+        nested_schemas = []
+        nested_names = set()
+        for name, property_schema in properties.items():
+            value_type, property_nested = field_type(
+                property_schema,
+                f"{title}{_schema_title(name)}",
+            )
+            if name not in required:
+                value_type = Optional[value_type]
+            for nested_schema in property_nested:
+                nested_name = nested_schema.type_class.__name__
+                if nested_name not in nested_names:
+                    nested_names.add(nested_name)
+                    nested_schemas.append(nested_schema)
+            apple_properties.append(
+                Property(
+                    name=name,
+                    type_class=value_type,
+                    description=property_schema.get("description"),
+                    guides=guides_for(resolve(property_schema)),
+                )
+            )
+
+        schema_type = type(title, (), {})
+        return fm.GenerationSchema(
+            type_class=schema_type,
+            description=(
+                schema.get("description")
+                or tool.description
+                or f"Arguments for {tool.name}"
+            ),
+            properties=apple_properties,
+            dynamic_nested_types=nested_schemas,
+        )
+
+    return build_schema(
+        root_schema,
+        f"{_schema_title(tool.name)}Arguments",
+    )
+
+
+async def _call_llm_tool(tool, arguments):
+    if not tool.implementation:
+        raise ValueError(f"No implementation available for tool: {tool.name}")
+
+    tool_call = llm.ToolCall(name=tool.name, arguments=arguments)
+    implementation_arguments = dict(arguments)
+    try:
+        signature = inspect.signature(tool.implementation)
+    except (TypeError, ValueError):
+        signature = None
+    if signature and "llm_tool_call" in signature.parameters:
+        implementation_arguments["llm_tool_call"] = tool_call
+
+    result = tool.implementation(**implementation_arguments)
+    if inspect.isawaitable(result):
+        result = await result
+    if isinstance(result, llm.ToolOutput):
+        if result.attachments:
+            raise ValueError(
+                "Apple Foundation tool output attachments are not supported yet"
+            )
+        result = result.output
+    if isinstance(result, str):
+        return result
+
+    result_for_model = result
+    time_fields = {}
+    if isinstance(result, dict):
+        result_for_model = dict(result)
+        for key, value in result.items():
+            if not isinstance(value, str) or "time" not in str(key).lower():
+                continue
+            match = re.match(
+                r"^(\d{4}-\d{2}-\d{2} )(\d{2})(:\d{2}(?::\d{2})?)(.*)$",
+                value,
+            )
+            if not match:
+                continue
+            hour = int(match.group(2))
+            period = "AM" if hour < 12 else "PM"
+            hour_12 = hour % 12 or 12
+            time_fields[f"{key}_12_hour"] = (
+                f"{match.group(1)}{hour_12:02d}{match.group(3)} "
+                f"{period}{match.group(4)}"
+            )
+        result_for_model.update(time_fields)
+
+    instructions = "The tool returned the following JSON. Preserve its values exactly."
+    if time_fields:
+        instructions += (
+            " When stating a time with AM or PM, use the corresponding "
+            "*_12_hour field."
+        )
+    return instructions + "\n" + json.dumps(result_for_model, default=repr)
+
+
+def _create_apple_tools(fm, tools):
+    apple_tools = []
+    for tool in tools:
+        arguments_schema = _tool_schema(fm, tool)
+
+        async def call(self, args, llm_tool=tool):
+            return await _call_llm_tool(llm_tool, args.value())
+
+        def get_arguments_schema(self, schema=arguments_schema):
+            return schema
+
+        tool_class = type(
+            f"{_schema_title(tool.name)}Tool",
+            (fm.Tool,),
+            {
+                "name": tool.name,
+                "description": tool.description or f"Call {tool.name}",
+                "arguments_schema": property(get_arguments_schema),
+                "call": call,
+            },
+        )
+        apple_tools.append(tool_class())
+    return apple_tools
+
+
 _TRANSCRIPT_ENCODING = "base64+zlib+json"
 
 
@@ -178,14 +408,16 @@ def _unpack_transcript(value):
             compressed = base64.b64decode(value["data"])
             return json.loads(zlib.decompress(compressed).decode("utf-8"))
         except (KeyError, TypeError, ValueError, zlib.error) as ex:
-            raise llm.ModelError("Stored Apple Foundation transcript is invalid") from ex
+            raise llm.ModelError(
+                "Stored Apple Foundation transcript is invalid"
+            ) from ex
     # Support transcripts logged by earlier development versions.
     if "transcript" in value:
         return value
     return None
 
 
-async def _create_session(fm, system_model, prompt, conversation):
+async def _create_session(fm, system_model, prompt, conversation, tools):
     if conversation:
         for previous_response in reversed(conversation.responses):
             transcript_data = _unpack_transcript(previous_response.response_json)
@@ -194,11 +426,13 @@ async def _create_session(fm, system_model, prompt, conversation):
                 return fm.LanguageModelSession.from_transcript(
                     transcript,
                     model=system_model,
+                    tools=tools,
                 )
 
     return fm.LanguageModelSession(
         instructions=prompt.system,
         model=system_model,
+        tools=tools,
     )
 
 
@@ -208,11 +442,13 @@ async def _execute_async(
     fm = _load_sdk()
     system_model = _create_system_model(fm, prompt.options)
     generation_options = _create_generation_options(fm, prompt.options)
+    apple_tools = _create_apple_tools(fm, prompt.tools)
     session = await _create_session(
         fm,
         system_model,
         prompt,
         conversation,
+        apple_tools,
     )
     try:
         if prompt.schema:
@@ -242,9 +478,7 @@ async def _execute_async(
                 options=generation_options,
             )
             yield result
-        response.response_json = _pack_transcript(
-            await session.transcript.to_dict()
-        )
+        response.response_json = _pack_transcript(await session.transcript.to_dict())
     except fm.FoundationModelsError as ex:
         raise llm.ModelError(str(ex)) from ex
 
@@ -281,6 +515,7 @@ def _sync_iterate(
 class AppleFoundationModel(llm.Model):
     model_id = "apple-foundation"
     supports_schema = True
+    supports_tools = True
     Options = AppleFoundationOptions
 
     def execute(self, prompt, stream, response, conversation=None):
@@ -292,6 +527,7 @@ class AppleFoundationModel(llm.Model):
 class AsyncAppleFoundationModel(llm.AsyncModel):
     model_id = "apple-foundation"
     supports_schema = True
+    supports_tools = True
     Options = AppleFoundationOptions
 
     async def execute(self, prompt, stream, response, conversation=None):

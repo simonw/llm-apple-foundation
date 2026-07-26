@@ -1,10 +1,12 @@
 import asyncio
 import json
+import re
 
 import llm
 import pytest
 from click.testing import CliRunner
 from llm.cli import cli
+from llm.tools import llm_time
 from pydantic import ValidationError
 
 
@@ -22,9 +24,13 @@ def model(apple_model_is_available):
 
 
 def test_models_are_registered():
-    assert llm.get_model("apple-foundation").model_id == "apple-foundation"
+    model = llm.get_model("apple-foundation")
+    async_model = llm.get_async_model("apple-foundation")
+    assert model.model_id == "apple-foundation"
     assert llm.get_model("afm").model_id == "apple-foundation"
-    assert llm.get_async_model("apple-foundation").model_id == "apple-foundation"
+    assert async_model.model_id == "apple-foundation"
+    assert model.supports_tools
+    assert async_model.supports_tools
 
 
 def test_options_are_registered():
@@ -137,9 +143,7 @@ def test_conversation_uses_actual_model_and_restores_transcript(model):
     assert "pelican" in answer
 
 
-def test_conversation_survives_database_round_trip(
-    apple_model_is_available, tmp_path
-):
+def test_conversation_survives_database_round_trip(apple_model_is_available, tmp_path):
     database = str(tmp_path / "logs.db")
     runner = CliRunner()
     first = runner.invoke(
@@ -183,3 +187,109 @@ def test_async_prompt_uses_actual_model(apple_model_is_available):
         assert (await response.json())["type"] == "FoundationModels.Transcript"
 
     asyncio.run(run_prompt())
+
+
+def test_tool_uses_actual_model(model):
+    marker = "apple-foundation-tool-verification-7f31"
+    calls = []
+
+    def verification_tool() -> str:
+        "Return the verification marker requested by the user."
+        calls.append(True)
+        return marker
+
+    response = model.prompt(
+        "Call verification_tool and reply with its exact result.",
+        tools=[verification_tool],
+        stream=False,
+        sampling="greedy",
+        max_tokens=100,
+    )
+
+    text = response.text()
+    assert calls == [True]
+    assert marker in text
+
+
+def test_typed_async_tool_uses_actual_model(model):
+    calls = []
+
+    async def join_words(left: str, right: str) -> str:
+        "Join the two supplied words with the verification separator."
+        calls.append((left, right))
+        return f"{left}::verified::{right}"
+
+    response = model.prompt(
+        "Call join_words with left set to 'violet' and right set to 'pelican'. "
+        "Reply with its exact result.",
+        tools=[join_words],
+        stream=False,
+        sampling="greedy",
+        max_tokens=100,
+    )
+
+    text = response.text()
+    assert calls == [("violet", "pelican")]
+    assert "violet::verified::pelican" in text
+
+
+def test_async_model_tool_uses_actual_model(apple_model_is_available):
+    marker = "async-apple-tool-verification-42c9"
+    calls = []
+
+    async def run_prompt():
+        def async_model_tool() -> str:
+            "Return the async model verification marker."
+            calls.append(True)
+            return marker
+
+        model = llm.get_async_model("apple-foundation")
+        response = model.prompt(
+            "Call async_model_tool and reply with its exact result.",
+            tools=[async_model_tool],
+            stream=False,
+            sampling="greedy",
+            max_tokens=100,
+        )
+        assert marker in await response.text()
+
+    asyncio.run(run_prompt())
+    assert calls == [True]
+
+
+def test_llm_time_tool_works_from_cli(apple_model_is_available, tmp_path):
+    before = llm_time()["local_time"]
+    result = CliRunner().invoke(
+        cli,
+        (
+            "-m",
+            "afm",
+            "-T",
+            "llm_time",
+            "--database",
+            str(tmp_path / "logs.db"),
+            "what time is it?",
+        ),
+    )
+    after = llm_time()["local_time"]
+
+    assert result.exit_code == 0, result.output
+    matches = re.finditer(
+        r"\b(\d{1,2}):(\d{2})(?:\s*([AP]M))?\b",
+        result.output,
+        re.IGNORECASE,
+    )
+    reported_times = set()
+    for match in matches:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if match.group(3):
+            hour %= 12
+            if match.group(3).upper() == "PM":
+                hour += 12
+        reported_times.add((hour, minute))
+    assert reported_times, result.output
+    expected_times = {
+        (int(value[11:13]), int(value[14:16])) for value in (before, after)
+    }
+    assert reported_times & expected_times, result.output

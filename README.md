@@ -132,6 +132,37 @@ llm -m apple-foundation \
 Apple's SDK does not stream guided generation, so schema responses are returned
 as one complete JSON value.
 
+### Tools
+
+Pass tools registered with LLM using `-T`:
+
+```bash
+llm -m afm -T llm_time "what time is it?"
+```
+
+Python functions can also be supplied as tools:
+
+```python
+import llm
+
+
+def multiply(a: int, b: int) -> int:
+    "Multiply two integers."
+    return a * b
+
+
+response = llm.get_model("afm").prompt(
+    "What is 17 times 24?",
+    tools=[multiply],
+)
+print(response.text())
+```
+
+The plugin translates LLM tool schemas to Apple generation schemas and supports
+both synchronous and asynchronous tool implementations. Apple invokes tools
+inside its native model session, then continues generation using the result.
+Tool output attachments are not yet supported.
+
 ### Async Python API
 
 An async model is registered alongside the synchronous CLI model:
@@ -149,10 +180,10 @@ async def generate():
 ## Current scope
 
 This initial version supports text generation, streaming, system instructions,
-generation options, structured output, persistent conversations, and both the
-synchronous and asynchronous LLM APIs.
+generation options, structured output, tools, persistent conversations, and
+both the synchronous and asynchronous LLM APIs.
 
-Tool calling and image attachments are not yet supported by this plugin.
+Image attachments are not yet supported by this plugin.
 
 ## Development
 
