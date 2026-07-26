@@ -22,6 +22,8 @@ jobs:
     - name: Install dependencies
       run: |
         pip install -e . --group dev
+        # And the LLM branch we need (for the moment until next alpha)
+        pip install https://github.com/simonw/llm/archive/fe830ef81869c097989fdd2a8d92753c26a16cae.zip
     - name: Run tests
       run: |
         python -m pytest
