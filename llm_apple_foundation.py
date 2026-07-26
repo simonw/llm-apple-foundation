@@ -4,7 +4,6 @@ import copy
 import inspect
 import json
 import queue
-import re
 import threading
 import zlib
 from typing import (
@@ -324,36 +323,7 @@ async def _call_llm_tool(tool, arguments):
         result = result.output
     if isinstance(result, str):
         return result
-
-    result_for_model = result
-    time_fields = {}
-    if isinstance(result, dict):
-        result_for_model = dict(result)
-        for key, value in result.items():
-            if not isinstance(value, str) or "time" not in str(key).lower():
-                continue
-            match = re.match(
-                r"^(\d{4}-\d{2}-\d{2} )(\d{2})(:\d{2}(?::\d{2})?)(.*)$",
-                value,
-            )
-            if not match:
-                continue
-            hour = int(match.group(2))
-            period = "AM" if hour < 12 else "PM"
-            hour_12 = hour % 12 or 12
-            time_fields[f"{key}_12_hour"] = (
-                f"{match.group(1)}{hour_12:02d}{match.group(3)} "
-                f"{period}{match.group(4)}"
-            )
-        result_for_model.update(time_fields)
-
-    instructions = "The tool returned the following JSON. Preserve its values exactly."
-    if time_fields:
-        instructions += (
-            " When stating a time with AM or PM, use the corresponding "
-            "*_12_hour field."
-        )
-    return instructions + "\n" + json.dumps(result_for_model, default=repr)
+    return json.dumps(result, default=repr)
 
 
 def _create_apple_tools(fm, tools):
