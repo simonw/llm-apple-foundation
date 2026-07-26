@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from importlib.metadata import version
 
 import llm
 import pytest
@@ -272,3 +273,64 @@ def test_llm_time_tool_works_from_cli(apple_model_is_available, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert re.search(r"\b\d{1,2}:\d{2}\b", result.output), result.output
+
+
+def test_tools_debug_uses_llm_lifecycle_hooks(apple_model_is_available, tmp_path):
+    result = CliRunner().invoke(
+        cli,
+        (
+            "-m",
+            "afm",
+            "-T",
+            "llm_version",
+            "--td",
+            "--database",
+            str(tmp_path / "logs.db"),
+            "Call llm_version and report its exact result.",
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Tool call: llm_version({})" in result.output
+    assert version("llm") in result.output
+
+
+def test_tool_uses_llm_lifecycle_hooks(model):
+    marker = "apple-foundation-lifecycle-verification-85d2"
+    events = []
+
+    def lifecycle_tool(llm_tool_call: llm.ToolCall) -> str:
+        "Return the lifecycle verification marker."
+        events.append(("implementation", llm_tool_call.tool_call_id))
+        return marker
+
+    def before_call(tool, tool_call):
+        events.append(("before", tool.name, tool_call.tool_call_id))
+
+    def after_call(tool, tool_call, tool_result):
+        events.append(
+            (
+                "after",
+                tool.name,
+                tool_call.tool_call_id,
+                tool_result.output,
+            )
+        )
+
+    response = model.chain(
+        "Call lifecycle_tool exactly once and reply with its exact result.",
+        tools=[lifecycle_tool],
+        before_call=before_call,
+        after_call=after_call,
+        stream=False,
+        options={"sampling": "greedy", "max_tokens": 100},
+    )
+
+    assert marker in response.text()
+    tool_call_id = events[0][2]
+    assert tool_call_id.startswith("tc_")
+    assert events == [
+        ("before", "lifecycle_tool", tool_call_id),
+        ("implementation", tool_call_id),
+        ("after", "lifecycle_tool", tool_call_id, marker),
+    ]

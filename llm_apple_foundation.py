@@ -1,13 +1,14 @@
 import asyncio
 import base64
 import copy
-import inspect
 import json
 import queue
 import threading
 import zlib
+from dataclasses import dataclass
 from typing import (
     AsyncGenerator,
+    Awaitable,
     Callable,
     Iterator,
     Literal,
@@ -16,6 +17,16 @@ from typing import (
 
 import llm
 from pydantic import Field, model_validator
+
+
+ToolExecutor = Callable[[llm.ToolCall], Awaitable[llm.ToolResult]]
+
+
+@dataclass
+class _ToolExecutionRequest:
+    tool_call: llm.ToolCall
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
 
 
 class AppleFoundationOptions(llm.Options):
@@ -299,40 +310,23 @@ def _tool_schema(fm, tool):
     )
 
 
-async def _call_llm_tool(tool, arguments):
-    if not tool.implementation:
-        raise ValueError(f"No implementation available for tool: {tool.name}")
-
-    tool_call = llm.ToolCall(name=tool.name, arguments=arguments)
-    implementation_arguments = dict(arguments)
-    try:
-        signature = inspect.signature(tool.implementation)
-    except (TypeError, ValueError):
-        signature = None
-    if signature and "llm_tool_call" in signature.parameters:
-        implementation_arguments["llm_tool_call"] = tool_call
-
-    result = tool.implementation(**implementation_arguments)
-    if inspect.isawaitable(result):
-        result = await result
-    if isinstance(result, llm.ToolOutput):
-        if result.attachments:
-            raise ValueError(
-                "Apple Foundation tool output attachments are not supported yet"
-            )
-        result = result.output
-    if isinstance(result, str):
-        return result
-    return json.dumps(result, default=repr)
-
-
-def _create_apple_tools(fm, tools):
+def _create_apple_tools(fm, tools, execute_tool_call: ToolExecutor):
     apple_tools = []
     for tool in tools:
         arguments_schema = _tool_schema(fm, tool)
 
         async def call(self, args, llm_tool=tool):
-            return await _call_llm_tool(llm_tool, args.value())
+            tool_result = await execute_tool_call(
+                llm.ToolCall(
+                    name=llm_tool.name,
+                    arguments=args.value(),
+                )
+            )
+            if tool_result.attachments:
+                raise ValueError(
+                    "Apple Foundation tool output attachments are not supported yet"
+                )
+            return tool_result.output
 
         def get_arguments_schema(self, schema=arguments_schema):
             return schema
@@ -407,12 +401,12 @@ async def _create_session(fm, system_model, prompt, conversation, tools):
 
 
 async def _execute_async(
-    prompt, stream, response, conversation
+    prompt, stream, response, conversation, execute_tool_call
 ) -> AsyncGenerator[str, None]:
     fm = _load_sdk()
     system_model = _create_system_model(fm, prompt.options)
     generation_options = _create_generation_options(fm, prompt.options)
-    apple_tools = _create_apple_tools(fm, prompt.tools)
+    apple_tools = _create_apple_tools(fm, prompt.tools, execute_tool_call)
     session = await _create_session(
         fm,
         system_model,
@@ -454,14 +448,21 @@ async def _execute_async(
 
 
 def _sync_iterate(
-    async_generator_factory: Callable[[], AsyncGenerator[str, None]],
+    async_generator_factory: Callable[[ToolExecutor], AsyncGenerator[str, None]],
+    response: llm.Response,
 ) -> Iterator[str]:
     items = queue.Queue()
     finished = object()
 
+    async def execute_tool_call(tool_call):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        items.put(_ToolExecutionRequest(tool_call, loop, future))
+        return await future
+
     async def consume():
         try:
-            async for item in async_generator_factory():
+            async for item in async_generator_factory(execute_tool_call):
                 items.put(item)
         except BaseException as ex:
             items.put(ex)
@@ -475,6 +476,14 @@ def _sync_iterate(
         item = items.get()
         if item is finished:
             break
+        if isinstance(item, _ToolExecutionRequest):
+            try:
+                tool_result = response.execute_tool_call(item.tool_call)
+            except Exception as ex:
+                item.loop.call_soon_threadsafe(item.future.set_exception, ex)
+            else:
+                item.loop.call_soon_threadsafe(item.future.set_result, tool_result)
+            continue
         if isinstance(item, BaseException):
             raise item
         yield item
@@ -490,7 +499,14 @@ class AppleFoundationModel(llm.Model):
 
     def execute(self, prompt, stream, response, conversation=None):
         yield from _sync_iterate(
-            lambda: _execute_async(prompt, stream, response, conversation)
+            lambda execute_tool_call: _execute_async(
+                prompt,
+                stream,
+                response,
+                conversation,
+                execute_tool_call,
+            ),
+            response,
         )
 
 
@@ -501,7 +517,13 @@ class AsyncAppleFoundationModel(llm.AsyncModel):
     Options = AppleFoundationOptions
 
     async def execute(self, prompt, stream, response, conversation=None):
-        async for chunk in _execute_async(prompt, stream, response, conversation):
+        async for chunk in _execute_async(
+            prompt,
+            stream,
+            response,
+            conversation,
+            response.execute_tool_call,
+        ):
             yield chunk
 
 

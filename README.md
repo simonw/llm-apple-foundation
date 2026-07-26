@@ -158,11 +158,6 @@ response = llm.get_model("afm").prompt(
 print(response.text())
 ```
 
-The plugin translates LLM tool schemas to Apple generation schemas and supports
-both synchronous and asynchronous tool implementations. Apple invokes tools
-inside its native model session, then continues generation using the result.
-Tool output attachments are not yet supported.
-
 ### Async Python API
 
 An async model is registered alongside the synchronous CLI model:
