@@ -10,18 +10,18 @@ jobs:
     runs-on: macos-26
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
         cache: pip
         cache-dependency-path: pyproject.toml
     - name: Install dependencies
       run: |
-        pip install -e . --group dev
+        pip install . --group dev
         # And the LLM branch we need (for the moment until next alpha)
         pip install https://github.com/simonw/llm/archive/fe830ef81869c097989fdd2a8d92753c26a16cae.zip
     - name: Run tests
