@@ -102,8 +102,8 @@ print(response.text())
 print(response.reply("Where do they nest?").text())
 ```
 
-Conversations that include image or other attachments cannot be continued
-with this model.
+Conversations that include image attachments in earlier messages cannot be
+continued with this model yet.
 
 The on-device model has a small context window (4,096 tokens at the time of
 writing). Long conversations will eventually exceed it, at which point the
@@ -209,6 +209,34 @@ execute each call. Those tool calls and their results are recorded on the
 response, so they show up in `llm logs` and are included when the conversation
 continues. LLM does not run them a second time.
 
+### Images
+
+On macOS 27 and later the on-device model can accept image attachments:
+
+```bash
+llm -m apple-foundation -a pelican.jpg "Describe this bird"
+```
+
+This needs all of the following:
+
+- macOS 27 or later
+- `apple-fm-sdk` built against the macOS 27 SDK, which requires Xcode 27 or later
+- Apple Intelligence available on the device. Virtual machines, including
+  GitHub Actions runners, report the model as unavailable.
+
+Where any of these are missing the model accepts no attachments, and LLM
+reports that it does not support them. Run this to check:
+
+```bash
+llm models --options -q apple-foundation
+```
+
+PNG, JPEG and HEIC images are accepted. Prompts with images are returned as a
+single chunk rather than streamed, and a conversation cannot yet be continued
+after a message that included an image.
+
+This feature has not yet been tested against the model running on macOS 27.
+
 ### Async Python API
 
 An async model is registered alongside the synchronous CLI model:
@@ -227,16 +255,18 @@ async def generate():
 
 This initial version supports text generation, streaming, system instructions,
 generation options, structured output, tools, conversations (including ones
-started with other models), and both the synchronous and asynchronous LLM
-APIs.
-
-Image attachments are not yet supported by this plugin.
+started with other models), image attachments on macOS 27, and both the
+synchronous and asynchronous LLM APIs.
 
 ## Development
 
 Most of the tests use the actual on-device Apple Foundation model. They are
 skipped if the SDK or model is unavailable. Tests for converting LLM's message
 history into Apple transcripts run without the model.
+
+`test_image_prompt_uses_actual_model` only runs where image prompts are
+supported (see [Images](#images)). On other Macs the image tests check
+everything up to the point where `apple-fm-sdk` rejects the image.
 
 ```bash
 cd llm-apple-foundation

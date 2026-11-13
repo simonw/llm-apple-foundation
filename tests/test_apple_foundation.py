@@ -1,6 +1,10 @@
 import asyncio
 import json
 import re
+import struct
+import sys
+import types
+import zlib
 from importlib.metadata import version
 
 import llm
@@ -387,7 +391,7 @@ def test_split_messages_without_trailing_user_message():
     )
     assert turn.instructions is None
     assert len(turn.history) == 3
-    assert turn.prompt == ""
+    assert turn.prompt == []
 
 
 def test_transcript_builder_converts_message_parts():
@@ -872,3 +876,252 @@ def test_context_window_error_is_explained(model):
             ],
             stream=False,
         ).text()
+
+
+# Image attachments
+#
+# Image prompts need macOS 27 at runtime and apple-fm-sdk built against the
+# macOS 27 SDK. Most of these tests exercise everything up to that boundary;
+# test_image_prompt_uses_actual_model only runs where images are supported.
+
+
+def _solid_png(rgb, size=16):
+    def chunk(kind, data):
+        checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+    row = b"\x00" + bytes(rgb) * size
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * size))
+        + chunk(b"IEND", b"")
+    )
+
+
+RED_PNG = _solid_png((255, 0, 0))
+IMAGES_SUPPORTED = llm_apple_foundation.supports_images()
+
+
+@pytest.fixture
+def supports_images(monkeypatch):
+    llm_apple_foundation.supports_images.cache_clear()
+    yield llm_apple_foundation.supports_images
+    llm_apple_foundation.supports_images.cache_clear()
+
+
+def _fake_sdk(available=True, variant="AFM 3 Core"):
+    class SystemLanguageModel:
+        def is_available(self):
+            return available, None if available else "DEVICE_NOT_ELIGIBLE"
+
+        @property
+        def variant(self):
+            if variant is None:
+                return None
+            return types.SimpleNamespace(display_name=variant)
+
+    return types.SimpleNamespace(SystemLanguageModel=SystemLanguageModel)
+
+
+@pytest.mark.parametrize(
+    "mac_version,sdk,expected",
+    (
+        ("27.0", _fake_sdk(), True),
+        # A VM such as a GitHub Actions runner
+        ("27.0", _fake_sdk(available=False), False),
+        # apple-fm-sdk built with an SDK older than macOS 27
+        ("27.0", _fake_sdk(variant=None), False),
+        # apple-fm-sdk is not installed
+        ("27.1", None, False),
+    ),
+)
+def test_supports_images_on_macos_27(
+    supports_images, monkeypatch, mac_version, sdk, expected
+):
+    monkeypatch.setattr(
+        llm_apple_foundation.platform, "mac_ver", lambda: (mac_version, "", "")
+    )
+    monkeypatch.setitem(sys.modules, "apple_fm_sdk", sdk)
+    assert supports_images() is expected
+
+
+@pytest.mark.parametrize("mac_version", ("26.4", "15.6", ""))
+def test_supports_images_before_macos_27_skips_sdk(
+    supports_images, monkeypatch, mac_version
+):
+    class Untouchable:
+        def __getattr__(self, name):
+            raise AssertionError("apple_fm_sdk should not be used")
+
+    monkeypatch.setattr(
+        llm_apple_foundation.platform, "mac_ver", lambda: (mac_version, "", "")
+    )
+    monkeypatch.setitem(sys.modules, "apple_fm_sdk", Untouchable())
+    assert supports_images() is False
+
+
+def test_attachment_types_follow_supports_images(monkeypatch):
+    model = llm.get_model("afm")
+    async_model = llm.get_async_model("afm")
+    monkeypatch.setattr(llm_apple_foundation, "supports_images", lambda: True)
+    assert model.attachment_types == {"image/png", "image/jpeg", "image/heic"}
+    assert async_model.attachment_types == model.attachment_types
+    monkeypatch.setattr(llm_apple_foundation, "supports_images", lambda: False)
+    assert model.attachment_types == frozenset()
+    assert async_model.attachment_types == frozenset()
+
+
+@pytest.mark.skipif(IMAGES_SUPPORTED, reason="This Mac supports image prompts")
+def test_cli_rejects_images_where_unsupported(tmp_path):
+    image = tmp_path / "red.png"
+    image.write_bytes(RED_PNG)
+    result = CliRunner().invoke(
+        cli,
+        (
+            "-m",
+            "afm",
+            "-a",
+            str(image),
+            "--database",
+            str(tmp_path / "logs.db"),
+            "What color is this?",
+        ),
+    )
+    assert result.exit_code != 0
+    assert "does not support attachments" in result.output
+
+
+def test_split_messages_keeps_supported_attachments_in_order():
+    image = llm.Attachment(content=RED_PNG)
+    turn = llm_apple_foundation._split_messages(
+        [llm.user("Compare", AttachmentPart(attachment=image), "with this")],
+        llm_apple_foundation.IMAGE_TYPES,
+    )
+    assert turn.prompt == ["Compare", image, "with this"]
+
+
+@pytest.mark.parametrize(
+    "attachment_types,match",
+    (
+        (frozenset(), "do not support attachments"),
+        (llm_apple_foundation.IMAGE_TYPES, "of type 'application/pdf'"),
+    ),
+)
+def test_split_messages_rejects_unsupported_attachments(attachment_types, match):
+    # messages= attachments are not validated by LLM before execute()
+    pdf = llm.Attachment(content=b"%PDF-1.4\n", type="application/pdf")
+    with pytest.raises(llm.ModelError, match=match):
+        llm_apple_foundation._split_messages(
+            [llm.user("Read this", AttachmentPart(attachment=pdf))],
+            attachment_types,
+        )
+
+
+def test_split_messages_rejects_attachments_in_history():
+    image = llm.Attachment(content=RED_PNG)
+    turn = llm_apple_foundation._split_messages(
+        [
+            llm.user("What color?", AttachmentPart(attachment=image)),
+            llm.assistant("Red."),
+            llm.user("Are you sure?"),
+        ],
+        llm_apple_foundation.IMAGE_TYPES,
+    )
+    builder = llm_apple_foundation._TranscriptBuilder()
+    with pytest.raises(llm.ModelError, match="earlier messages"):
+        builder.add_message(turn.history[0])
+
+
+@pytest.mark.parametrize(
+    "components,expected",
+    (
+        (["Hello"], "Hello"),
+        (["Hello", "world"], ["Hello", "world"]),
+        ([], ""),
+    ),
+)
+def test_apple_prompt_for_text(components, expected):
+    with llm_apple_foundation._apple_prompt(None, components) as apple_prompt:
+        assert apple_prompt == expected
+
+
+def test_apple_prompt_writes_content_attachments_to_temporary_files(tmp_path):
+    class FakeImageAttachment:
+        def __init__(self, path, label=None):
+            self.path = path
+            self.data = path.read_bytes()
+
+    fake_fm = types.SimpleNamespace(ImageAttachment=FakeImageAttachment)
+    image_path = tmp_path / "red.png"
+    image_path.write_bytes(RED_PNG)
+    components = [
+        "Compare",
+        llm.Attachment(path=str(image_path)),
+        llm.Attachment(content=RED_PNG),
+    ]
+    with llm_apple_foundation._apple_prompt(fake_fm, components) as apple_prompt:
+        text, from_path, from_content = apple_prompt
+        assert text == "Compare"
+        # Files on disk are passed to the SDK directly
+        assert from_path.path == image_path
+        # Content is written to a temporary file with a matching suffix
+        temporary = from_content.path
+        assert temporary.suffix == ".png"
+        assert from_content.data == RED_PNG
+        assert temporary.exists()
+    assert not temporary.exists()
+
+
+@pytest.mark.skipif(IMAGES_SUPPORTED, reason="This Mac supports image prompts")
+@pytest.mark.parametrize("stream", (False, True))
+def test_image_prompt_reaches_sdk(model, monkeypatch, tmp_path, stream):
+    # Pretend images are supported so the prompt reaches apple-fm-sdk, which
+    # rejects the image because this Mac or SDK build predates macOS 27
+    fm = pytest.importorskip("apple_fm_sdk")
+    monkeypatch.setattr(llm_apple_foundation, "supports_images", lambda: True)
+    created = []
+    real_image_attachment = fm.ImageAttachment
+
+    def recording_image_attachment(path, label=None):
+        created.append((path, path.read_bytes()))
+        return real_image_attachment(path, label)
+
+    monkeypatch.setattr(fm, "ImageAttachment", recording_image_attachment)
+    image_path = tmp_path / "red.png"
+    image_path.write_bytes(RED_PNG)
+
+    with pytest.raises(llm.ModelError, match="Failed to add attachment to prompt"):
+        model.prompt(
+            "What color is this image?",
+            attachments=[
+                llm.Attachment(path=str(image_path)),
+                llm.Attachment(content=RED_PNG),
+            ],
+            stream=stream,
+        ).text()
+
+    assert created[0] == (image_path, RED_PNG)
+    temporary, data = created[1]
+    assert temporary.suffix == ".png"
+    assert data == RED_PNG
+    assert not temporary.exists()
+
+
+@pytest.mark.skipif(
+    not IMAGES_SUPPORTED,
+    reason="Image prompts need macOS 27 and apple-fm-sdk built with Xcode 27",
+)
+def test_image_prompt_uses_actual_model(model):
+    conversation = model.conversation()
+    response = conversation.prompt(
+        "What is the main color of this image? Reply with one word.",
+        attachments=[llm.Attachment(content=RED_PNG)],
+        stream=False,
+        max_tokens=20,
+        **GREEDY,
+    )
+    assert "red" in response.text().lower()
+    # Earlier images cannot be rebuilt into a transcript yet
+    with pytest.raises(llm.ModelError, match="earlier messages"):
+        conversation.prompt("Are you sure?", stream=False).text()

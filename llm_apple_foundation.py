@@ -1,10 +1,15 @@
 import asyncio
+import contextlib
 import copy
+import functools
 import json
+import platform
 import queue
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import (
     AsyncGenerator,
     Awaitable,
@@ -31,6 +36,43 @@ ToolExecutor = Callable[[llm.ToolCall], Awaitable[llm.ToolResult]]
 # that Apple's session runs mid-response are tagged with it so they can be
 # replayed into the transcript when the conversation continues.
 PROVIDER = "apple_foundation"
+
+# Image formats accepted for attachments. Apple has not documented which
+# formats the on-device model accepts, so this list is unverified.
+IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/heic"})
+_IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/heic": ".heic"}
+
+
+@functools.cache
+def supports_images() -> bool:
+    """Can the on-device Apple Foundation model accept image prompts here?
+
+    All three must hold:
+
+    - running on macOS 27 or later
+    - apple-fm-sdk was built against the macOS 27 SDK (Xcode 27+)
+    - Apple Intelligence is available on this device; a VM, such as a
+      GitHub Actions runner, reports DEVICE_NOT_ELIGIBLE even when the
+      first two pass
+    """
+    major = platform.mac_ver()[0].split(".")[0]
+    if not major.isdigit() or int(major) < 27:
+        return False  # skip importing the SDK entirely
+    try:
+        import apple_fm_sdk as fm
+    except ImportError:
+        return False
+    model = fm.SystemLanguageModel()
+    available, _reason = model.is_available()
+    if not available:
+        return False
+    # In apple-fm-sdk 0.2.2 `variant` is gated exactly like image
+    # attachments: macOS 27 at runtime and the macOS 27 SDK at build time.
+    return model.variant is not None
+
+
+def _attachment_types():
+    return IMAGE_TYPES if supports_images() else frozenset()
 
 
 @dataclass
@@ -398,6 +440,15 @@ def _unsupported_attachments():
     return llm.ModelError("Apple Foundation models do not support attachments yet")
 
 
+def _attachments_in_history():
+    # Apple's transcript JSON format for image segments is only defined in
+    # the macOS 27 SDK, so earlier images cannot be rebuilt into a transcript
+    return llm.ModelError(
+        "Apple Foundation models cannot yet continue a conversation that "
+        "includes attachments in earlier messages"
+    )
+
+
 def _replayable(part):
     # Tool activity from another provider's server-side tools cannot be
     # replayed. Tool calls run by this plugin are also marked
@@ -434,7 +485,7 @@ class _TranscriptBuilder:
                 if _replayable(part):
                     self._add_tool_output(part)
             elif isinstance(part, AttachmentPart):
-                raise _unsupported_attachments()
+                raise _attachments_in_history()
             # ReasoningPart has no Foundation Models equivalent
         self._flush()
 
@@ -456,7 +507,7 @@ class _TranscriptBuilder:
 
     def _add_tool_output(self, part):
         if part.attachments:
-            raise _unsupported_attachments()
+            raise _attachments_in_history()
         self._flush()
         tool_call_id = part.tool_call_id or _new_id()
         self.entries.append(
@@ -495,14 +546,17 @@ class _TranscriptBuilder:
 class _Turn:
     instructions: Optional[str]
     history: list
-    prompt: Union[str, list[str]]
+    # Text and llm.Attachment objects for the new prompt, in order
+    prompt: list
 
 
-def _split_messages(messages) -> _Turn:
+def _split_messages(messages, attachment_types=frozenset()) -> _Turn:
     """Split prompt.messages into instructions, prior history and new prompt.
 
     prompt.messages is the complete input chain for this turn, including
     history from earlier turns, other models and explicit messages= lists.
+    LLM only validates attachments passed with attachments=, so the types
+    of attachments in the new prompt are checked here.
     """
     instructions = []
     history = []
@@ -517,25 +571,59 @@ def _split_messages(messages) -> _Turn:
         else:
             history.append(message)
 
-    prompt: Union[str, list[str]] = ""
+    prompt = []
     if history and history[-1].role == "user":
         current = history.pop()
-        texts = []
         for part in current.parts:
-            if isinstance(part, AttachmentPart):
-                raise _unsupported_attachments()
-            if isinstance(part, TextPart) and part.text:
-                texts.append(part.text)
-        if len(texts) == 1:
-            prompt = texts[0]
-        elif texts:
-            prompt = texts
+            if isinstance(part, AttachmentPart) and part.attachment:
+                attachment_type = part.attachment.resolve_type()
+                if attachment_type not in attachment_types:
+                    if not attachment_types:
+                        raise _unsupported_attachments()
+                    raise llm.ModelError(
+                        "Apple Foundation models do not support attachments "
+                        f"of type '{attachment_type}'"
+                    )
+                prompt.append(part.attachment)
+            elif isinstance(part, TextPart) and part.text:
+                prompt.append(part.text)
 
     return _Turn(
         instructions="\n\n".join(instructions) or None,
         history=history,
         prompt=prompt,
     )
+
+
+@contextlib.contextmanager
+def _apple_prompt(fm, components):
+    """Convert the new prompt's text and attachments for apple-fm-sdk.
+
+    The SDK only accepts images as files on disk, so attachments provided
+    as content or URLs are written to a temporary directory that lasts for
+    the duration of the response.
+    """
+    if not any(isinstance(component, llm.Attachment) for component in components):
+        if len(components) == 1:
+            yield components[0]
+        else:
+            yield list(components) or ""
+        return
+
+    with tempfile.TemporaryDirectory(prefix="llm-apple-foundation-") as directory:
+        apple_components = []
+        for index, component in enumerate(components):
+            if not isinstance(component, llm.Attachment):
+                apple_components.append(component)
+                continue
+            if component.path:
+                path = Path(component.path)
+            else:
+                suffix = _IMAGE_SUFFIXES.get(component.resolve_type(), "")
+                path = Path(directory) / f"attachment-{index}{suffix}"
+                path.write_bytes(component.content_bytes())
+            apple_components.append(fm.ImageAttachment(path))
+        yield apple_components
 
 
 async def _create_session(fm, system_model, turn, tools):
@@ -572,7 +660,7 @@ async def _execute_async(
     system_model = _create_system_model(fm, prompt.options)
     _record_model_variant(system_model, response)
     generation_options = _create_generation_options(fm, prompt.options)
-    turn = _split_messages(prompt.messages)
+    turn = _split_messages(prompt.messages, _attachment_types())
 
     # apple-fm-sdk runs each tool on its own thread and event loop, and its
     # stream_response() blocks this event loop while waiting for snapshots.
@@ -599,58 +687,80 @@ async def _execute_async(
 
     apple_tools = _create_apple_tools(fm, prompt.tools, run_tool)
     try:
-        session, existing_entries = await _create_session(
-            fm, system_model, turn, apple_tools
-        )
-        if prompt.schema:
-            result = await session.respond(
-                turn.prompt,
-                json_schema=_normalize_schema(prompt.schema),
-                options=generation_options,
+        with _apple_prompt(fm, turn.prompt) as apple_prompt:
+            session, existing_entries = await _create_session(
+                fm, system_model, turn, apple_tools
             )
-            for event in recorded_tool_events():
-                yield event
-            yield result.to_json()
-        elif stream:
-            previous_snapshot = ""
-            async for snapshot in session.stream_response(
-                turn.prompt,
-                options=generation_options,
+            # In apple-fm-sdk 0.2.2 stream_response() hangs if an image cannot
+            # be added to the prompt, because the error is raised in a thread
+            # that never signals completion. respond() reports the error.
+            has_attachments = any(
+                isinstance(component, llm.Attachment) for component in turn.prompt
+            )
+            async for item in _generate(
+                session,
+                apple_prompt,
+                prompt.schema,
+                stream and not has_attachments,
+                generation_options,
+                recorded_tool_events,
             ):
-                for event in recorded_tool_events():
-                    yield event
-                if not snapshot.startswith(previous_snapshot):
-                    raise llm.ModelError(
-                        "Apple Foundation model returned a non-monotonic stream"
-                    )
-                delta = snapshot[len(previous_snapshot) :]
-                previous_snapshot = snapshot
-                if delta:
-                    yield delta
-        else:
-            result = await session.respond(
-                turn.prompt,
-                options=generation_options,
-            )
-            for event in recorded_tool_events():
-                yield event
-            yield result
-        for event in recorded_tool_events():
-            yield event
-        transcript = await session.transcript.to_dict()
+                yield item
+            # Read the transcript while any temporary image files still exist
+            transcript = await session.transcript.to_dict()
     except fm.ExceededContextWindowSizeError as ex:
         raise llm.ModelError(
             "This conversation exceeds the Apple Foundation model's context "
             f"window of {system_model.context_size} tokens. Start a new "
             "conversation or use a shorter prompt."
         ) from ex
-    except fm.FoundationModelsError as ex:
+    except (fm.FoundationModelsError, fm.ImagePromptError) as ex:
         raise llm.ModelError(str(ex)) from ex
 
     # Record the transcript entries Apple added for this turn
     entries = transcript["transcript"]["entries"]
     transcript["transcript"]["entries"] = entries[existing_entries:]
     response.response_json = transcript
+
+
+async def _generate(
+    session, apple_prompt, schema, stream, generation_options, recorded_tool_events
+):
+    if schema:
+        result = await session.respond(
+            apple_prompt,
+            json_schema=_normalize_schema(schema),
+            options=generation_options,
+        )
+        for event in recorded_tool_events():
+            yield event
+        yield result.to_json()
+    elif stream:
+        previous_snapshot = ""
+        async for snapshot in session.stream_response(
+            apple_prompt,
+            options=generation_options,
+        ):
+            for event in recorded_tool_events():
+                yield event
+            if not snapshot.startswith(previous_snapshot):
+                raise llm.ModelError(
+                    "Apple Foundation model returned a non-monotonic stream"
+                )
+            delta = snapshot[len(previous_snapshot) :]
+            previous_snapshot = snapshot
+            if delta:
+                yield delta
+    else:
+        result = await session.respond(
+            apple_prompt,
+            options=generation_options,
+        )
+        for event in recorded_tool_events():
+            yield event
+        yield result
+    for event in recorded_tool_events():
+        yield event
 
 
 def _sync_iterate(
@@ -705,6 +815,11 @@ class AppleFoundationModel(llm.Model):
     supports_tools = True
     Options = AppleFoundationOptions
 
+    @property
+    def attachment_types(self):
+        # Images need macOS 27 at runtime and the macOS 27 SDK at build time
+        return _attachment_types()
+
     def execute(self, prompt, stream, response, conversation=None):
         # Conversation history is read from prompt.messages, not conversation
         yield from _sync_iterate(
@@ -723,6 +838,11 @@ class AsyncAppleFoundationModel(llm.AsyncModel):
     supports_schema = True
     supports_tools = True
     Options = AppleFoundationOptions
+
+    @property
+    def attachment_types(self):
+        # Images need macOS 27 at runtime and the macOS 27 SDK at build time
+        return _attachment_types()
 
     async def execute(self, prompt, stream, response, conversation=None):
         async for chunk in _execute_async(
