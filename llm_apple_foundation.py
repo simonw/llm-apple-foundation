@@ -1,10 +1,9 @@
 import asyncio
-import base64
 import copy
 import json
 import queue
 import threading
-import zlib
+import uuid
 from dataclasses import dataclass
 from typing import (
     AsyncGenerator,
@@ -13,13 +12,25 @@ from typing import (
     Iterator,
     Literal,
     Optional,
+    Union,
 )
 
 import llm
+from llm.parts import (
+    AttachmentPart,
+    StreamEvent,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 from pydantic import Field, model_validator
 
-
 ToolExecutor = Callable[[llm.ToolCall], Awaitable[llm.ToolResult]]
+
+# Namespace for provider_metadata on parts this plugin records. Tool calls
+# that Apple's session runs mid-response are tagged with it so they can be
+# replayed into the transcript when the conversation continues.
+PROVIDER = "apple_foundation"
 
 
 @dataclass
@@ -113,6 +124,13 @@ def _create_system_model(fm, options):
         reason_name = getattr(reason, "name", str(reason))
         raise llm.ModelError(f"Apple Foundation model is unavailable: {reason_name}")
     return model
+
+
+def _record_model_variant(system_model, response):
+    # Only reported on macOS 27+ with an SDK built against the macOS 27 SDK
+    variant = system_model.variant
+    if variant is not None and variant.display_name:
+        response.set_resolved_model(variant.display_name)
 
 
 def _create_generation_options(fm, options):
@@ -310,23 +328,18 @@ def _tool_schema(fm, tool):
     )
 
 
-def _create_apple_tools(fm, tools, execute_tool_call: ToolExecutor):
+def _create_apple_tools(fm, tools, run_tool: Callable[[llm.ToolCall], Awaitable[str]]):
     apple_tools = []
     for tool in tools:
         arguments_schema = _tool_schema(fm, tool)
 
         async def call(self, args, llm_tool=tool):
-            tool_result = await execute_tool_call(
+            return await run_tool(
                 llm.ToolCall(
                     name=llm_tool.name,
                     arguments=args.value(),
                 )
             )
-            if tool_result.attachments:
-                raise ValueError(
-                    "Apple Foundation tool output attachments are not supported yet"
-                )
-            return tool_result.output
 
         def get_arguments_schema(self, schema=arguments_schema):
             return schema
@@ -345,89 +358,267 @@ def _create_apple_tools(fm, tools, execute_tool_call: ToolExecutor):
     return apple_tools
 
 
-_TRANSCRIPT_ENCODING = "base64+zlib+json"
+def _tool_events(tool_call: llm.ToolCall, tool_result: llm.ToolResult):
+    """StreamEvents recording a tool call that Apple's session ran mid-response.
 
-
-def _pack_transcript(transcript):
-    raw = json.dumps(
-        transcript,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return {
-        "type": "FoundationModels.Transcript",
-        "encoding": _TRANSCRIPT_ENCODING,
-        "data": base64.b64encode(zlib.compress(raw)).decode("ascii"),
+    These are marked server_executed because the call and its result both
+    happen inside this single response: LLM must not execute them again.
+    """
+    metadata = {PROVIDER: {"provider_managed": True}}
+    common = {
+        "tool_call_id": tool_result.tool_call_id,
+        "server_executed": True,
+        "provider_metadata": metadata,
     }
+    return [
+        StreamEvent(type="tool_call_name", chunk=tool_call.name, **common),
+        StreamEvent(
+            type="tool_call_args",
+            chunk=json.dumps(tool_call.arguments or {}),
+            **common,
+        ),
+        StreamEvent(
+            type="tool_result",
+            chunk=tool_result.output,
+            tool_name=tool_call.name,
+            **common,
+        ),
+    ]
 
 
-def _unpack_transcript(value):
-    if (
-        not isinstance(value, dict)
-        or value.get("type") != "FoundationModels.Transcript"
-    ):
-        return None
-    if value.get("encoding") == _TRANSCRIPT_ENCODING:
-        try:
-            compressed = base64.b64decode(value["data"])
-            return json.loads(zlib.decompress(compressed).decode("utf-8"))
-        except (KeyError, TypeError, ValueError, zlib.error) as ex:
-            raise llm.ModelError(
-                "Stored Apple Foundation transcript is invalid"
-            ) from ex
-    # Support transcripts logged by earlier development versions.
-    if "transcript" in value:
-        return value
-    return None
+def _new_id():
+    return str(uuid.uuid4()).upper()
 
 
-async def _create_session(fm, system_model, prompt, conversation, tools):
-    if conversation:
-        for previous_response in reversed(conversation.responses):
-            transcript_data = _unpack_transcript(previous_response.response_json)
-            if transcript_data:
-                transcript = await fm.Transcript.from_dict(transcript_data)
-                return fm.LanguageModelSession.from_transcript(
-                    transcript,
-                    model=system_model,
-                    tools=tools,
-                )
+def _text_segments(texts):
+    return [{"type": "text", "id": _new_id(), "text": text} for text in texts]
 
-    return fm.LanguageModelSession(
-        instructions=prompt.system,
+
+def _unsupported_attachments():
+    return llm.ModelError("Apple Foundation models do not support attachments yet")
+
+
+def _replayable(part):
+    # Tool activity from another provider's server-side tools cannot be
+    # replayed. Tool calls run by this plugin are also marked
+    # server_executed, but carry our namespace in provider_metadata.
+    return not part.server_executed or PROVIDER in (part.provider_metadata or {})
+
+
+class _TranscriptBuilder:
+    """Convert llm.Message history into Foundation Models transcript entries.
+
+    The entry format matches what ``Transcript.to_dict()`` produces and what
+    ``Transcript.from_dict()`` accepts. Every entry and segment needs an id,
+    and prompt entries need an ``options`` dictionary.
+    """
+
+    def __init__(self):
+        self.entries = []
+        self._role = None
+        self._texts = []
+        self._tool_calls = []
+
+    def add_message(self, message):
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                if part.text:
+                    self._add_text(
+                        "response" if message.role == "assistant" else "user",
+                        part.text,
+                    )
+            elif isinstance(part, ToolCallPart):
+                if _replayable(part):
+                    self._add_tool_call(part)
+            elif isinstance(part, ToolResultPart):
+                if _replayable(part):
+                    self._add_tool_output(part)
+            elif isinstance(part, AttachmentPart):
+                raise _unsupported_attachments()
+            # ReasoningPart has no Foundation Models equivalent
+        self._flush()
+
+    def _add_text(self, role, text):
+        if self._role != role:
+            self._flush()
+            self._role = role
+        self._texts.append(text)
+
+    def _add_tool_call(self, part):
+        self._flush_texts()
+        self._tool_calls.append(
+            {
+                "id": part.tool_call_id or _new_id(),
+                "name": part.name,
+                "arguments": json.dumps(part.arguments or {}),
+            }
+        )
+
+    def _add_tool_output(self, part):
+        if part.attachments:
+            raise _unsupported_attachments()
+        self._flush()
+        tool_call_id = part.tool_call_id or _new_id()
+        self.entries.append(
+            {
+                "role": "tool",
+                "id": tool_call_id,
+                "toolCallID": tool_call_id,
+                "toolName": part.name,
+                "contents": _text_segments([part.output or ""]),
+            }
+        )
+
+    def _flush_texts(self):
+        if self._texts:
+            entry = {
+                "role": self._role,
+                "id": _new_id(),
+                "contents": _text_segments(self._texts),
+            }
+            if self._role == "user":
+                entry["options"] = {}
+            self.entries.append(entry)
+        self._texts = []
+        self._role = None
+
+    def _flush(self):
+        self._flush_texts()
+        if self._tool_calls:
+            self.entries.append(
+                {"role": "response", "id": _new_id(), "toolCalls": self._tool_calls}
+            )
+            self._tool_calls = []
+
+
+@dataclass
+class _Turn:
+    instructions: Optional[str]
+    history: list
+    prompt: Union[str, list[str]]
+
+
+def _split_messages(messages) -> _Turn:
+    """Split prompt.messages into instructions, prior history and new prompt.
+
+    prompt.messages is the complete input chain for this turn, including
+    history from earlier turns, other models and explicit messages= lists.
+    """
+    instructions = []
+    history = []
+    for message in messages:
+        if message.role == "system":
+            for part in message.parts:
+                if isinstance(part, TextPart):
+                    if part.text:
+                        instructions.append(part.text)
+                elif isinstance(part, AttachmentPart):
+                    raise _unsupported_attachments()
+        else:
+            history.append(message)
+
+    prompt: Union[str, list[str]] = ""
+    if history and history[-1].role == "user":
+        current = history.pop()
+        texts = []
+        for part in current.parts:
+            if isinstance(part, AttachmentPart):
+                raise _unsupported_attachments()
+            if isinstance(part, TextPart) and part.text:
+                texts.append(part.text)
+        if len(texts) == 1:
+            prompt = texts[0]
+        elif texts:
+            prompt = texts
+
+    return _Turn(
+        instructions="\n\n".join(instructions) or None,
+        history=history,
+        prompt=prompt,
+    )
+
+
+async def _create_session(fm, system_model, turn, tools):
+    """Create a session with the turn's instructions, tools and history.
+
+    Returns the session and the number of transcript entries it starts with.
+    """
+    session = fm.LanguageModelSession(
+        instructions=turn.instructions,
         model=system_model,
         tools=tools,
     )
+    transcript = await session.transcript.to_dict()
+    if not turn.history:
+        return session, len(transcript["transcript"]["entries"])
+
+    builder = _TranscriptBuilder()
+    for message in turn.history:
+        builder.add_message(message)
+    # Keep the instructions entry Apple created, which describes the tools
+    transcript["transcript"]["entries"].extend(builder.entries)
+    restored = fm.LanguageModelSession.from_transcript(
+        await fm.Transcript.from_dict(transcript),
+        model=system_model,
+        tools=tools,
+    )
+    return restored, len(transcript["transcript"]["entries"])
 
 
 async def _execute_async(
-    prompt, stream, response, conversation, execute_tool_call
-) -> AsyncGenerator[str, None]:
+    prompt, stream, response, execute_tool_call: ToolExecutor
+) -> AsyncGenerator[Union[str, StreamEvent], None]:
     fm = _load_sdk()
     system_model = _create_system_model(fm, prompt.options)
+    _record_model_variant(system_model, response)
     generation_options = _create_generation_options(fm, prompt.options)
-    apple_tools = _create_apple_tools(fm, prompt.tools, execute_tool_call)
-    session = await _create_session(
-        fm,
-        system_model,
-        prompt,
-        conversation,
-        apple_tools,
-    )
+    turn = _split_messages(prompt.messages)
+
+    # apple-fm-sdk runs each tool on its own thread and event loop, and its
+    # stream_response() blocks this event loop while waiting for snapshots.
+    # Tools therefore execute where the SDK calls them, recording their
+    # events in a thread-safe queue that is drained between snapshots.
+    tool_events: queue.Queue = queue.Queue()
+
+    async def run_tool(tool_call):
+        tool_result = await execute_tool_call(tool_call)
+        if tool_result.attachments:
+            raise ValueError(
+                "Apple Foundation tool output attachments are not supported yet"
+            )
+        for event in _tool_events(tool_call, tool_result):
+            tool_events.put(event)
+        return tool_result.output
+
+    def recorded_tool_events():
+        while True:
+            try:
+                yield tool_events.get_nowait()
+            except queue.Empty:
+                return
+
+    apple_tools = _create_apple_tools(fm, prompt.tools, run_tool)
     try:
+        session, existing_entries = await _create_session(
+            fm, system_model, turn, apple_tools
+        )
         if prompt.schema:
             result = await session.respond(
-                prompt.prompt or "",
+                turn.prompt,
                 json_schema=_normalize_schema(prompt.schema),
                 options=generation_options,
             )
+            for event in recorded_tool_events():
+                yield event
             yield result.to_json()
         elif stream:
             previous_snapshot = ""
             async for snapshot in session.stream_response(
-                prompt.prompt or "",
+                turn.prompt,
                 options=generation_options,
             ):
+                for event in recorded_tool_events():
+                    yield event
                 if not snapshot.startswith(previous_snapshot):
                     raise llm.ModelError(
                         "Apple Foundation model returned a non-monotonic stream"
@@ -438,19 +629,36 @@ async def _execute_async(
                     yield delta
         else:
             result = await session.respond(
-                prompt.prompt or "",
+                turn.prompt,
                 options=generation_options,
             )
+            for event in recorded_tool_events():
+                yield event
             yield result
-        response.response_json = _pack_transcript(await session.transcript.to_dict())
+        for event in recorded_tool_events():
+            yield event
+        transcript = await session.transcript.to_dict()
+    except fm.ExceededContextWindowSizeError as ex:
+        raise llm.ModelError(
+            "This conversation exceeds the Apple Foundation model's context "
+            f"window of {system_model.context_size} tokens. Start a new "
+            "conversation or use a shorter prompt."
+        ) from ex
     except fm.FoundationModelsError as ex:
         raise llm.ModelError(str(ex)) from ex
 
+    # Record the transcript entries Apple added for this turn
+    entries = transcript["transcript"]["entries"]
+    transcript["transcript"]["entries"] = entries[existing_entries:]
+    response.response_json = transcript
+
 
 def _sync_iterate(
-    async_generator_factory: Callable[[ToolExecutor], AsyncGenerator[str, None]],
+    async_generator_factory: Callable[
+        [ToolExecutor], AsyncGenerator[Union[str, StreamEvent], None]
+    ],
     response: llm.Response,
-) -> Iterator[str]:
+) -> Iterator[Union[str, StreamEvent]]:
     items = queue.Queue()
     finished = object()
 
@@ -498,12 +706,12 @@ class AppleFoundationModel(llm.Model):
     Options = AppleFoundationOptions
 
     def execute(self, prompt, stream, response, conversation=None):
+        # Conversation history is read from prompt.messages, not conversation
         yield from _sync_iterate(
             lambda execute_tool_call: _execute_async(
                 prompt,
                 stream,
                 response,
-                conversation,
                 execute_tool_call,
             ),
             response,
@@ -521,7 +729,6 @@ class AsyncAppleFoundationModel(llm.AsyncModel):
             prompt,
             stream,
             response,
-            conversation,
             response.execute_tool_call,
         ):
             yield chunk

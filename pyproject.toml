@@ -18,8 +18,8 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "apple-fm-sdk>=0.2.1",
-    "llm>=0.32a3"
+    "apple-fm-sdk>=0.2.2",
+    "llm>=0.37.2"
 ]
 
 [build-system]
@@ -39,4 +39,11 @@ CI = "https://github.com/simonw/llm-apple-foundation/actions"
 apple_foundation = "llm_apple_foundation"
 
 [dependency-groups]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "pytest-timeout>=2.4.0",
+]
+
+[tool.pytest.ini_options]
+# apple-fm-sdk calls into native code that can block, so fail hung tests
+timeout = 120
